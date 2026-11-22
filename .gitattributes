@@ -1,0 +1,4 @@
+# 换行符策略：bat 必须 CRLF（中文 Windows cmd 解析），sh/command 保持 LF
+*.bat text eol=crlf
+*.sh text eol=lf
+*.command text eol=lf
