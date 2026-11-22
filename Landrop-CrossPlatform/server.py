@@ -3,18 +3,23 @@
 """Landrop — 局域网快传（纯 Python 标准库，零依赖）
 
 用法:
-    python3 server.py [存储目录]
+    python3 server.py [存储目录] [访问密钥]
 环境变量:
     LANDROP_PORT  监听端口，默认 8989（被占用时自动 +1 往后找）
+    LANDROP_KEY   访问密钥：设置后所有设备需先输密钥登录；
+                  也可用命令行第 2 参数、~/.landrop_key 文件，
+                  或在本机打开网页点右上角"⚙ 设置"配置
 """
 import json
 import mimetypes
 import os
 import re
+import secrets
 import socket
 import sys
 import time
 import urllib.parse
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 PORT = int(os.environ.get("LANDROP_PORT", "8989"))
@@ -25,6 +30,59 @@ os.makedirs(STORE, exist_ok=True)
 
 IMG_EXT = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".svg", ".ico"}
 INLINE_EXT = IMG_EXT | {".pdf", ".txt", ".md", ".mp4", ".mp3", ".mov", ".json", ".csv", ".log"}
+
+
+KEY_FILE = os.path.join(os.path.expanduser("~"), ".landrop_key")
+
+
+def load_key():
+    """访问密钥来源优先级：环境变量 LANDROP_KEY > 命令行第 2 参数 > ~/.landrop_key 文件。"""
+    k = os.environ.get("LANDROP_KEY", "").strip()
+    if not k and len(sys.argv) > 2:
+        k = sys.argv[2].strip()
+    if not k:
+        try:
+            with open(KEY_FILE, encoding="utf-8") as f:
+                k = f.readline().strip()
+        except OSError:
+            pass
+    return k
+
+
+KEY = load_key()
+SESSIONS = set()              # 已登录设备令牌，服务重启后需重新输密钥
+COOKIE_NAME = "landrop_token"
+PILL = ('style="color:var(--dim);font-size:12px;text-decoration:none;'
+        'border:1px solid var(--line);border-radius:99px;padding:1px 10px;margin-left:6px"')
+AUTH_HTML = '<a href="/logout" %s>退出</a>' % PILL
+SETTINGS_LINK = '<a href="/settings" %s>⚙ 设置</a>' % PILL
+
+LOGIN_PAGE = r"""<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Landrop · 访问验证</title>
+<style>
+:root{--bg:#10141c;--card:#1a212e;--line:#2a3446;--tx:#e8edf5;--dim:#8a97ab;--ac:#4f8cff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:15px/1.5 -apple-system,"PingFang SC","Segoe UI",sans-serif;padding:24px 16px}
+.wrap{max-width:360px;margin:14vh auto 0}
+h1{font-size:26px;margin-bottom:4px}
+.sub{color:var(--dim);margin-bottom:18px}
+input{width:100%;background:var(--card);border:1px solid var(--line);border-radius:10px;color:var(--tx);padding:11px 12px;font:inherit;margin-bottom:12px}
+button{width:100%;background:var(--ac);color:#fff;border:0;border-radius:10px;padding:10px;font-size:15px;cursor:pointer}
+.err{color:#ff6b6b;margin-bottom:10px;font-size:13px}
+</style></head><body>
+<div class="wrap">
+  <h1>📮 Landrop</h1>
+  <div class="sub">此服务已开启访问验证，输入密钥后即可互传文件</div>
+  <form method="post" action="/login">
+    <input name="key" type="password" placeholder="访问密钥" autofocus>
+    __ERR__
+    <button>进 入</button>
+  </form>
+</div>
+</body></html>"""
 
 
 def lan_ips():
@@ -130,7 +188,7 @@ td .del{background:none;border:none;color:#ff6b6b;padding:2px 6px;font-size:16px
     <button id="sendtxt">发送文本</button>
   </div>
   <div id="prog"></div>
-  <h2>📂 共享文件 <button class="ghost" id="rf">刷新</button></h2>
+  <h2>📂 共享文件 <button class="ghost" id="rf">刷新</button>__AUTH__</h2>
   <table><thead><tr><th>文件</th><th>大小</th><th>时间</th><th></th></tr></thead><tbody id="rows"></tbody></table>
 </div>
 <script src="https://cdn.jsdelivr.net/gh/davidshimjs/qrcodejs/qrcode.min.js"></script>
@@ -205,6 +263,36 @@ function refresh(){
 refresh();setInterval(refresh,4000);
 </script></body></html>"""
 
+SETTINGS_PAGE = r"""<!doctype html>
+<html lang="zh"><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Landrop · 访问验证设置</title>
+<style>
+:root{--bg:#10141c;--card:#1a212e;--line:#2a3446;--tx:#e8edf5;--dim:#8a97ab;--ac:#4f8cff}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--tx);font:15px/1.5 -apple-system,"PingFang SC","Segoe UI",sans-serif;padding:24px 16px}
+.wrap{max-width:360px;margin:14vh auto 0}
+h1{font-size:26px;margin-bottom:4px}
+.card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:14px;font-size:14px}
+input{width:100%;background:#10141c;border:1px solid var(--line);border-radius:10px;color:var(--tx);padding:11px 12px;font:inherit;margin-bottom:12px}
+button{width:100%;background:var(--ac);color:#fff;border:0;border-radius:10px;padding:10px;font-size:15px;cursor:pointer}
+.tip{color:var(--dim);font-size:12px;line-height:1.7}
+a{color:var(--ac);text-decoration:none}
+</style></head><body>
+<div class="wrap">
+  <h1>⚙ 访问验证</h1>
+  <div class="card">当前状态：<b>__STATE__</b></div>
+  <form method="post" action="/settings">
+    <input name="newkey" type="password" placeholder="输入新密钥（留空并保存 = 关闭验证）" autofocus>
+    <button>保存</button>
+  </form>
+  <p class="tip">仅限本机打开此页操作 · 保存后所有设备需用新密钥重新登录<br>
+  密钥持久保存在 ~/.landrop_key；若启动时设置了环境变量 LANDROP_KEY，则环境变量优先</p>
+  <p class="tip"><a href="/">← 返回</a></p>
+</div>
+</body></html>"""
+
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "Landrop/1.0"
@@ -220,6 +308,33 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(b)
 
+    def send_html(self, html, code=200):
+        b = html.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def authed(self):
+        """未设置密钥 = 全开放；设置了则校验会话 Cookie。"""
+        if not KEY:
+            return True
+        c = SimpleCookie(self.headers.get("Cookie", ""))
+        return COOKIE_NAME in c and c[COOKIE_NAME].value in SESSIONS
+
+    def is_local(self):
+        return self.client_address[0] in ("127.0.0.1", "::1")
+
+    def auth_links(self):
+        """页面操作入口：退出（开启验证且已登录时）+ 设置（仅本机可见）。"""
+        links = []
+        if KEY and self.authed():
+            links.append(AUTH_HTML)
+        if self.is_local():
+            links.append(SETTINGS_LINK)
+        return "".join(links)
+
     def redirect(self, loc):
         self.send_response(302)
         self.send_header("Location", loc)
@@ -230,9 +345,39 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urllib.parse.urlsplit(self.path)
         route = path.path
-        if route == "/" or route == "/index.html":
+        if route == "/login":
+            if not KEY:
+                self.redirect("/")
+                return
+            self.send_html(LOGIN_PAGE.replace("__ERR__", ""))
+        elif route == "/logout":
+            c = SimpleCookie(self.headers.get("Cookie", ""))
+            if COOKIE_NAME in c:
+                SESSIONS.discard(c[COOKIE_NAME].value)
+            self.send_response(302)
+            self.send_header("Set-Cookie", "%s=; Path=/; HttpOnly; Max-Age=0" % COOKIE_NAME)
+            self.send_header("Location", "/login" if KEY else "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+        elif route == "/settings":
+            if not self.is_local():
+                self.send_json({"error": "此页面仅限在本机（127.0.0.1）打开"}, 403)
+            else:
+                state = ("已开启 —— 密钥已设置，保存在 ~/.landrop_key" if KEY else
+                         "未开启 —— 任何拿到网址的同网设备都能直接访问")
+                self.send_html(SETTINGS_PAGE.replace("__STATE__", state))
+        elif route == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+        elif not self.authed():
+            if route in ("/", "/index.html") or route.startswith("/files/"):
+                self.redirect("/login")
+            else:
+                self.send_json({"error": "需要访问验证，请先登录"}, 401)
+        elif route == "/" or route == "/index.html":
             b = PAGE.replace("__IPS_JSON__", json.dumps(lan_ips())) \
-                    .replace("__PORT__", str(PORT)).encode("utf-8")
+                    .replace("__PORT__", str(PORT)) \
+                    .replace("__AUTH__", self.auth_links()).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
@@ -274,18 +419,69 @@ class Handler(BaseHTTPRequestHandler):
                     if not c:
                         break
                     self.wfile.write(c)
-        elif route == "/favicon.ico":
-            self.send_response(204)
-            self.end_headers()
         else:
             self.redirect("/")
 
     # ---------- POST ----------
     def do_POST(self):
+        global KEY
         path = urllib.parse.urlsplit(self.path)
         route = path.path
         q = urllib.parse.parse_qs(path.query)
-        if route == "/upload":
+        if route == "/login":
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace")
+            supplied = urllib.parse.parse_qs(body).get("key", [""])[0]
+            if supplied and secrets.compare_digest(supplied, KEY):
+                tok = secrets.token_hex(32)
+                SESSIONS.add(tok)
+                self.send_response(302)
+                self.send_header("Set-Cookie",
+                                 "%s=%s; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax"
+                                 % (COOKIE_NAME, tok))
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                self.send_html(LOGIN_PAGE.replace(
+                    "__ERR__", '<div class="err">密钥不对，再试一次</div>'), 401)
+        elif route == "/settings":
+            # 仅限本机：既是配置入口，也是忘记密钥时的重置后门
+            if not self.is_local():
+                self.send_json({"error": "此操作仅限在本机（127.0.0.1）执行"}, 403)
+                return
+            n = int(self.headers.get("Content-Length") or 0)
+            body = self.rfile.read(n).decode("utf-8", "replace")
+            newkey = urllib.parse.parse_qs(body).get("newkey", [""])[0].strip()
+            if newkey:
+                try:
+                    with open(KEY_FILE, "w", encoding="utf-8") as f:
+                        f.write(newkey + "\n")
+                except OSError as e:
+                    self.send_json({"error": str(e)}, 500)
+                    return
+                KEY = newkey
+                SESSIONS.clear()
+                tok = secrets.token_hex(32)
+                SESSIONS.add(tok)
+                self.send_response(302)
+                self.send_header("Set-Cookie",
+                                 "%s=%s; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax"
+                                 % (COOKIE_NAME, tok))
+                self.send_header("Location", "/")
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+            else:
+                try:
+                    os.remove(KEY_FILE)
+                except OSError:
+                    pass
+                KEY = ""
+                SESSIONS.clear()
+                self.redirect("/")
+        elif not self.authed():
+            self.send_json({"error": "需要访问验证，请先登录"}, 401)
+        elif route == "/upload":
             name = self.headers.get("X-Filename") or (q.get("name") or [""])[0]
             name = safe_name(urllib.parse.unquote(name))
             n = int(self.headers.get("Content-Length") or 0)
@@ -345,6 +541,9 @@ def main():
     if srv is None:
         raise SystemExit("8989~9013 全被占用")
     print("Landrop 已启动，共享目录: %s" % STORE, flush=True)
+    print("访问验证: %s" % ("已开启（密钥已设置）" if KEY else
+          "未开启 —— 设置 LANDROP_KEY 环境变量 / 第 2 个命令行参数 / ~/.landrop_key 文件可启用"),
+          flush=True)
     for ip in lan_ips():
         print("  ➜  http://%s:%d" % (ip, PORT), flush=True)
     try:
