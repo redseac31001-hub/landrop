@@ -1,9 +1,10 @@
 #!/bin/bash
-# 生成双击客户端 Landrop.app 到桌面（覆盖旧版）
+# 生成双击客户端 Landrop.app 到桌面（覆盖旧版，含项目图标）
 # 行为：双击 → 服务活着直接开窗口；没跑先拉起再开窗口（Chrome 应用模式，无地址栏）
 DIR="$(cd "$(dirname "$0")/.." && pwd)"
+APP="$HOME/Desktop/Landrop.app"
 ESC="${DIR//\"/\\\"}"
-if osacompile -o "$HOME/Desktop/Landrop.app" <<APPLESCRIPT
+if osacompile -o "$APP" <<APPLESCRIPT
 -- Landrop.app — 双击启动：确保后台服务在跑，然后弹出独立客户端窗口
 set serverUp to false
 try
@@ -23,7 +24,19 @@ on error
 end try
 APPLESCRIPT
 then
-  echo "✅ 已生成桌面客户端：$HOME/Desktop/Landrop.app"
+  # 替换为项目图标（applet 默认图标槽），并重新 ad-hoc 签名
+  ICON_APPLIED=0
+  if [ -f "$DIR/assets/landrop.icns" ]; then
+    if cp "$DIR/assets/landrop.icns" "$APP/Contents/Resources/applet.icns"; then
+      ICON_APPLIED=1
+      codesign --force --deep -s - "$APP" 2>/dev/null
+    fi
+  fi
+  if [ "$ICON_APPLIED" = 1 ]; then
+    echo "✅ 已生成桌面客户端：$APP（带项目图标）"
+  else
+    echo "✅ 已生成桌面客户端：$APP（未找到 assets/landrop.icns，使用默认图标）"
+  fi
   echo "   以后双击它即可；想改行为可重新运行本脚本覆盖生成"
 else
   echo "[!] 生成失败，请把本文件拖进终端回车，把报错发出来排查"
